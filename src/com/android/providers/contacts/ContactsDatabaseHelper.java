@@ -115,7 +115,7 @@ public class ContactsDatabaseHelper extends SQLiteOpenHelper {
      *   800-899 Kitkat
      * </pre>
      */
-    static final int DATABASE_VERSION = 804;
+    static final int DATABASE_VERSION = 806;
 
     private static final String DATABASE_NAME = "contacts2.db";
     private static final String DATABASE_PRESENCE = "presence_db";
@@ -284,12 +284,13 @@ public class ContactsDatabaseHelper extends SQLiteOpenHelper {
                 " LEFT OUTER JOIN (SELECT "
                         + "data.data1 AS member_count_group_id, "
                         + "COUNT(data.raw_contact_id) AS group_member_count "
-                    + "FROM data "
-                    + "WHERE "
+                        + "FROM data , raw_contacts "
+                        + "WHERE data.raw_contact_id = raw_contacts._id and raw_contacts.deleted" +
+                        "!= 1 and "
                         + "data.mimetype_id = (SELECT _id FROM mimetypes WHERE "
-                            + "mimetypes.mimetype = '" + GroupMembership.CONTENT_ITEM_TYPE + "')"
-                    + "GROUP BY member_count_group_id) AS member_count_table" // End of inner query
-                + " ON (groups._id = member_count_table.member_count_group_id)";
+                        + "mimetypes.mimetype = '" + GroupMembership.CONTENT_ITEM_TYPE + "')"
+                        + "GROUP BY member_count_group_id) AS member_count_table"
+                        + " ON (groups._id = member_count_table.member_count_group_id)";
     }
 
     public interface Views {
@@ -507,6 +508,7 @@ public class ContactsDatabaseHelper extends SQLiteOpenHelper {
         public static final String RAW_CONTACT_ID = "raw_contact_id";
         public static final String NORMALIZED_NUMBER = "normalized_number";
         public static final String MIN_MATCH = "min_match";
+        public static final String NORMALIZED = "normalized";
     }
 
     public interface NameLookupColumns {
@@ -667,6 +669,7 @@ public class ContactsDatabaseHelper extends SQLiteOpenHelper {
         public static final String CONTACT_ID = "contact_id";
         public static final String CONTENT = "content";
         public static final String NAME = "name";
+        public static final String NAME_DIGIT = "name_digit";
         public static final String TOKENS = "tokens";
     }
 
@@ -1158,7 +1161,8 @@ public class ContactsDatabaseHelper extends SQLiteOpenHelper {
                 PhoneLookupColumns.RAW_CONTACT_ID
                         + " INTEGER REFERENCES raw_contacts(_id) NOT NULL," +
                 PhoneLookupColumns.NORMALIZED_NUMBER + " TEXT NOT NULL," +
-                PhoneLookupColumns.MIN_MATCH + " TEXT NOT NULL" +
+                PhoneLookupColumns.MIN_MATCH + " TEXT NOT NULL," +
+                PhoneLookupColumns.NORMALIZED + " TEXT NOT NULL" +
         ");");
 
         db.execSQL("CREATE INDEX phone_lookup_index ON " + Tables.PHONE_LOOKUP + " (" +
@@ -1300,7 +1304,8 @@ public class ContactsDatabaseHelper extends SQLiteOpenHelper {
                 Voicemails.SOURCE_DATA + " TEXT," +
                 Voicemails.SOURCE_PACKAGE + " TEXT," +
                 Voicemails.STATE + " INTEGER," +
-                Calls.SUBSCRIPTION + " INTEGER NOT NULL DEFAULT 0" +
+                Calls.SUBSCRIPTION + " INTEGER NOT NULL DEFAULT 0," +
+                Calls.DURATION_TYPE + " INTEGER NOT NULL DEFAULT " + Calls.DURATION_TYPE_ACTIVE +
         ");");
 
         // Voicemail source status table.
@@ -1407,6 +1412,7 @@ public class ContactsDatabaseHelper extends SQLiteOpenHelper {
                     + SearchIndexColumns.CONTACT_ID + " INTEGER REFERENCES contacts(_id) NOT NULL,"
                     + SearchIndexColumns.CONTENT + " TEXT, "
                     + SearchIndexColumns.NAME + " TEXT, "
+                    + SearchIndexColumns.NAME_DIGIT + " TEXT, "
                     + SearchIndexColumns.TOKENS + " TEXT"
                 + ")");
         if (rebuildSqliteStats) {
@@ -1772,13 +1778,18 @@ public class ContactsDatabaseHelper extends SQLiteOpenHelper {
         String contactsSelect = "SELECT "
                 + ContactsColumns.CONCRETE_ID + " AS " + Contacts._ID + ","
                 + contactsColumns + ", "
+                + AccountsColumns.ACCOUNT_NAME + ", "
+                + AccountsColumns.ACCOUNT_TYPE + ", "
                 + buildDisplayPhotoUriAlias(ContactsColumns.CONCRETE_ID, Contacts.PHOTO_URI) + ", "
                 + buildThumbnailPhotoUriAlias(ContactsColumns.CONCRETE_ID,
                         Contacts.PHOTO_THUMBNAIL_URI) + ", "
                 + dbForProfile() + " AS " + Contacts.IS_USER_PROFILE
                 + " FROM " + Tables.CONTACTS
                 + " JOIN " + Tables.RAW_CONTACTS + " AS name_raw_contact ON("
-                +   Contacts.NAME_RAW_CONTACT_ID + "=name_raw_contact." + RawContacts._ID + ")";
+                +   Contacts.NAME_RAW_CONTACT_ID + "=name_raw_contact." + RawContacts._ID + ")"
+                + " JOIN " + Tables.ACCOUNTS + " AS name_accounts ON("
+                + "name_raw_contact." + RawContactsColumns.ACCOUNT_ID + "=name_accounts."
+                + AccountsColumns._ID + ")";
 
         db.execSQL("CREATE VIEW " + Views.CONTACTS + " AS " + contactsSelect);
 
@@ -2535,6 +2546,19 @@ public class ContactsDatabaseHelper extends SQLiteOpenHelper {
         if (oldVersion < 804) {
             upgradeToVersion804(db);
             oldVersion = 804;
+        }
+
+        if (oldVersion < 805) {
+         // This version add one column to calls table which is used to save
+         // the subscription for the calls slot.
+            upgradeToVersion805(db);
+            oldVersion = 805;
+        }
+
+        if (oldVersion < 806) {
+            // add the type of call duration
+            upgradeToVersion806(db);
+            oldVersion = 806;
         }
 
         if (upgradeViewsAndTriggers) {
@@ -4042,6 +4066,9 @@ public class ContactsDatabaseHelper extends SQLiteOpenHelper {
         try {
             db.execSQL("ALTER TABLE " + Tables.CALLS
                     + " ADD " + Calls.SUBSCRIPTION + " INTEGER NOT NULL DEFAULT 0;");
+            db.execSQL("ALTER TABLE " + Tables.PHONE_LOOKUP
+                    + " ADD " + PhoneLookupColumns.NORMALIZED + " TEXT NOT NULL DEFAULT '0';");
+            updateSearchIndexTable(db);
         } catch (SQLException e) {
             Log.w(TAG, "Exception upgrading contacts2.db from 803 to 804 " + e);
         }
@@ -4059,6 +4086,50 @@ public class ContactsDatabaseHelper extends SQLiteOpenHelper {
         Log.v(TAG, "Adding is_restricted column to database");
         db.execSQL("ALTER TABLE raw_contacts"
                 + " ADD is_restricted INTEGER;");
+    }
+
+    private void updateSearchIndexTable(SQLiteDatabase db) {
+        db.execSQL("CREATE VIRTUAL TABLE " + "search_index_temp"
+                + " USING FTS4 ("
+                + SearchIndexColumns.CONTACT_ID + " INTEGER REFERENCES contacts(_id) NOT NULL,"
+                + SearchIndexColumns.CONTENT + " TEXT, "
+                + SearchIndexColumns.NAME + " TEXT, "
+                + SearchIndexColumns.NAME_DIGIT + " TEXT, "
+                + SearchIndexColumns.TOKENS + " TEXT"
+                + ")");
+        db.execSQL("INSERT INTO search_index_temp "
+                + "SELECT contact_id,content,name,NULL,tokens from " + Tables.SEARCH_INDEX);
+        db.execSQL("DROP TABLE IF EXISTS " + Tables.SEARCH_INDEX);
+        db.execSQL("CREATE VIRTUAL TABLE " + Tables.SEARCH_INDEX
+                + " USING FTS4 ("
+                + SearchIndexColumns.CONTACT_ID + " INTEGER REFERENCES contacts(_id) NOT NULL,"
+                + SearchIndexColumns.CONTENT + " TEXT, "
+                + SearchIndexColumns.NAME + " TEXT, "
+                + SearchIndexColumns.NAME_DIGIT + " TEXT, "
+                + SearchIndexColumns.TOKENS + " TEXT"
+                + ")");
+        db.execSQL("INSERT INTO " + Tables.SEARCH_INDEX
+                + " SELECT contact_id,content,name,name_digit,tokens from search_index_temp");
+        db.execSQL("DROP TABLE IF EXISTS search_index_temp");
+        updateSqliteStats(db);
+    }
+
+    private void upgradeToVersion805(SQLiteDatabase db) {
+        try {
+            db.execSQL("ALTER TABLE " + Tables.CALLS
+                    + " ADD " + Calls.SUBSCRIPTION + " INTEGER NOT NULL DEFAULT 0;");
+        } catch (SQLException e) {
+            Log.w(TAG, "Exception upgrading contacts2.db from 803 to 804 " + e);
+        }
+    }
+
+    private void upgradeToVersion806(SQLiteDatabase db) {
+        try {
+            db.execSQL("ALTER TABLE " + Tables.CALLS + " ADD " + Calls.DURATION_TYPE
+                    + " INTEGER NOT NULL DEFAULT " + Calls.DURATION_TYPE_ACTIVE + ";");
+        } catch (SQLException e) {
+            Log.w(TAG, "Exception upgrading contacts2.db from 805 to 806 " + e);
+        }
     }
 
     public String extractHandleFromEmailAddress(String email) {
