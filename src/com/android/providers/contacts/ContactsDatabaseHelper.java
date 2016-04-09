@@ -92,6 +92,9 @@ import com.google.common.annotations.VisibleForTesting;
 
 import libcore.icu.ICU;
 
+import com.cyanogen.ambient.incall.CallLogConstants;
+
+import java.util.HashMap;
 import java.util.Locale;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -121,7 +124,7 @@ public class ContactsDatabaseHelper extends SQLiteOpenHelper {
      *   1000-1099 M
      * </pre>
      */
-    static final int DATABASE_VERSION = 1012;
+    static final int DATABASE_VERSION = 1013;
 
     public interface Tables {
         public static final String CONTACTS = "contacts";
@@ -1532,6 +1535,8 @@ public class ContactsDatabaseHelper extends SQLiteOpenHelper {
                 Calls.CACHED_PHOTO_URI + " TEXT," +
                 Calls.CACHED_FORMATTED_NUMBER + " TEXT," +
                 CallColumns.ORIGIN + " TEXT," +
+                CallLogConstants.PLUGIN_PACKAGE_NAME + " TEXT DEFAULT NULL," +
+                CallLogConstants.PLUGIN_USER_HANDLE + " TEXT DEFAULT NULL," +
                 Voicemails._DATA + " TEXT," +
                 Voicemails.HAS_CONTENT + " INTEGER," +
                 Voicemails.MIME_TYPE + " TEXT," +
@@ -2923,6 +2928,11 @@ public class ContactsDatabaseHelper extends SQLiteOpenHelper {
         if (oldVersion < 1012) {
             upgradeToVersion1012(db);
             oldVersion = 1012;
+        }
+
+        if (oldVersion < 1013) {
+            upgradeToVersion1013(db);
+            oldVersion = 1013;
         }
 
         if (upgradeViewsAndTriggers) {
@@ -4480,6 +4490,15 @@ public class ContactsDatabaseHelper extends SQLiteOpenHelper {
                 + " TEXT DEFAULT NULL;");
     }
 
+    // Add Plugin name and User handle for incall api plugins.
+    private void upgradeToVersion1013(SQLiteDatabase db) {
+        db.execSQL("ALTER TABLE " + Tables.CALLS + " ADD " + CallLogConstants.PLUGIN_PACKAGE_NAME
+                + " TEXT DEFAULT NULL;");
+
+        db.execSQL("ALTER TABLE " + Tables.CALLS + " ADD " + CallLogConstants.PLUGIN_USER_HANDLE
+                + " TEXT DEFAULT NULL;");
+    }
+
     public String extractHandleFromEmailAddress(String email) {
         Rfc822Token[] tokens = Rfc822Tokenizer.tokenize(email);
         if (tokens.length == 0) {
@@ -5234,6 +5253,12 @@ public class ContactsDatabaseHelper extends SQLiteOpenHelper {
         qb.appendWhere(sb.toString());
     }
 
+    public void buildDataLookupAndContactQuery(SQLiteQueryBuilder qb, String data) {
+        StringBuilder sb = new StringBuilder();
+        buildDataQuery(sb, data);
+        qb.setTables(sb.toString());
+    }
+
     /**
      * Phone lookup method that uses the custom SQLite function phone_number_compare_loose
      * that serves as a fallback in case the regular lookup does not return any results.
@@ -5308,6 +5333,14 @@ public class ContactsDatabaseHelper extends SQLiteOpenHelper {
                 + PhoneLookupColumns.MIN_MATCH + " = '");
         sb.append(minMatch);
         sb.append("')) AS lookup, " + Tables.DATA);
+    }
+
+    private void buildDataQuery(StringBuilder sb, String lookupData) {
+        // Todo: make more performant
+        sb.append(Tables.RAW_CONTACTS +
+                " JOIN " + Views.DATA + " data_view ON (data_view.raw_contact_id = "
+                + Tables.RAW_CONTACTS  + "._id) WHERE data1 = ");
+        DatabaseUtils.appendEscapedSQLString(sb, lookupData);
     }
 
     private void appendPhoneLookupSelection(StringBuilder sb, String number, String numberE164) {
